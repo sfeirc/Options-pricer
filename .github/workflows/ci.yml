@@ -1,0 +1,186 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    name: Build & Test (${{ matrix.os }} / ${{ matrix.build_type }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+        build_type: [Release, Debug]
+        include:
+          - os: ubuntu-22.04
+            avx_flag: -mavx2
+          - os: ubuntu-24.04
+            avx_flag: -mavx2
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            cmake ninja-build \
+            libbenchmark-dev \
+            gcc-12 g++-12 \
+            valgrind
+
+      - name: Check AVX2 support
+        run: |
+          if grep -q avx2 /proc/cpuinfo; then
+            echo "AVX2 supported"
+          else
+            echo "WARNING: AVX2 not supported on this runner — SIMD paths may fail"
+          fi
+
+      - name: Configure (Release)
+        if: matrix.build_type == 'Release'
+        run: |
+          cmake -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-12
+
+      - name: Configure (Debug + ASan)
+        if: matrix.build_type == 'Debug'
+        run: |
+          cmake -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_COMPILER=g++-12 \
+            -DENABLE_ASAN=ON \
+            -DENABLE_UBSAN=ON
+
+      - name: Build
+        run: cmake --build build --parallel $(nproc)
+
+      - name: Run unit tests
+        run: |
+          cd build
+          ctest --output-on-failure --timeout 120
+
+      - name: Run benchmarks (quick smoke test)
+        if: matrix.build_type == 'Release'
+        run: |
+          ./build/bm_options \
+            --benchmark_filter="BM_BS" \
+            --benchmark_min_time=0.1s \
+            --benchmark_out=benchmark_results.json \
+            --benchmark_out_format=json
+
+      - name: Upload benchmark results
+        if: matrix.build_type == 'Release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-${{ matrix.os }}
+          path: benchmark_results.json
+
+  asan-run:
+    name: AddressSanitizer full run
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y cmake ninja-build libbenchmark-dev gcc-12 g++-12
+      - name: Build with ASan
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_COMPILER=g++-12 \
+            -DENABLE_ASAN=ON
+          cmake --build build --parallel $(nproc)
+      - name: Run under ASan
+        run: |
+          ASAN_OPTIONS=detect_leaks=1 \
+          ./build/bm_options \
+            --benchmark_filter="UT_" \
+            --benchmark_min_time=0.01s
+
+  clang-tidy:
+    name: clang-tidy static analysis
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y cmake ninja-build libbenchmark-dev clang-14 clang-tidy-14
+      - name: Configure
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=clang++-14 \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+      - name: Run clang-tidy
+        run: |
+          clang-tidy-14 \
+            -p build \
+            src/options/*.cpp \
+            tools/greeks_dashboard.cpp \
+            -- -std=c++20 -mavx2 -mfma \
+            2>&1 | tee clang_tidy.log
+          # Fail if errors found (warnings OK)
+          ! grep -q "error:" clang_tidy.log
+
+  perf-regression:
+    name: Performance regression check
+    runs-on: ubuntu-22.04
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install deps
+        run: sudo apt-get update -y && sudo apt-get install -y cmake ninja-build libbenchmark-dev g++-12
+      - name: Build PR branch
+        run: |
+          cmake -B build_pr -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-12
+          cmake --build build_pr --parallel $(nproc)
+      - name: Benchmark PR
+        run: |
+          ./build_pr/bm_options \
+            --benchmark_filter="BM_BS" \
+            --benchmark_min_time=1s \
+            --benchmark_out=pr_results.json \
+            --benchmark_out_format=json
+      - name: Build base branch
+        run: |
+          git checkout ${{ github.base_ref }}
+          cmake -B build_base -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-12
+          cmake --build build_base --parallel $(nproc)
+      - name: Benchmark base
+        run: |
+          ./build_base/bm_options \
+            --benchmark_filter="BM_BS" \
+            --benchmark_min_time=1s \
+            --benchmark_out=base_results.json \
+            --benchmark_out_format=json
+      - name: Compare results
+        run: |
+          # Simple comparison: fail if PR is >10% slower than base on any benchmark
+          python3 -c "
+          import json, sys
+          base = {b['name']: b['real_time'] for b in json.load(open('base_results.json'))['benchmarks']}
+          pr   = {b['name']: b['real_time'] for b in json.load(open('pr_results.json'))['benchmarks']}
+          failed = []
+          for name in base:
+              if name in pr:
+                  ratio = pr[name] / base[name]
+                  if ratio > 1.10:
+                      failed.append(f'{name}: {ratio:.2%} slower')
+          if failed:
+              print('Performance regression detected:')
+              for f in failed: print(' ', f)
+              sys.exit(1)
+          print('No performance regression detected.')
+          "
