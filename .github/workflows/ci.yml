@@ -15,11 +15,6 @@ jobs:
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04]
         build_type: [Release, Debug]
-        include:
-          - os: ubuntu-22.04
-            avx_flag: -mavx2
-          - os: ubuntu-24.04
-            avx_flag: -mavx2
 
     steps:
       - name: Checkout
@@ -31,15 +26,14 @@ jobs:
           sudo apt-get install -y \
             cmake ninja-build \
             libbenchmark-dev \
-            gcc-12 g++-12 \
-            valgrind
+            gcc-12 g++-12
 
       - name: Check AVX2 support
         run: |
           if grep -q avx2 /proc/cpuinfo; then
             echo "AVX2 supported"
           else
-            echo "WARNING: AVX2 not supported on this runner — SIMD paths may fail"
+            echo "WARNING: AVX2 not supported on this runner"
           fi
 
       - name: Configure (Release)
@@ -73,7 +67,7 @@ jobs:
         run: |
           ./build/bm_options \
             --benchmark_filter="BM_BS" \
-            --benchmark_min_time=0.1s \
+            --benchmark_min_time=0.1 \
             --benchmark_out=benchmark_results.json \
             --benchmark_out_format=json
 
@@ -81,7 +75,7 @@ jobs:
         if: matrix.build_type == 'Release'
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-${{ matrix.os }}
+          name: benchmark-${{ matrix.os }}-${{ matrix.build_type }}
           path: benchmark_results.json
 
   asan-run:
@@ -104,7 +98,7 @@ jobs:
           ASAN_OPTIONS=detect_leaks=1 \
           ./build/bm_options \
             --benchmark_filter="UT_" \
-            --benchmark_min_time=0.01s
+            --benchmark_min_time=0.01
 
   clang-tidy:
     name: clang-tidy static analysis
@@ -127,9 +121,7 @@ jobs:
             -p build \
             src/options/*.cpp \
             tools/greeks_dashboard.cpp \
-            -- -std=c++20 -mavx2 -mfma \
             2>&1 | tee clang_tidy.log
-          # Fail if errors found (warnings OK)
           ! grep -q "error:" clang_tidy.log
 
   perf-regression:
@@ -150,7 +142,7 @@ jobs:
         run: |
           ./build_pr/bm_options \
             --benchmark_filter="BM_BS" \
-            --benchmark_min_time=1s \
+            --benchmark_min_time=1 \
             --benchmark_out=pr_results.json \
             --benchmark_out_format=json
       - name: Build base branch
@@ -162,12 +154,11 @@ jobs:
         run: |
           ./build_base/bm_options \
             --benchmark_filter="BM_BS" \
-            --benchmark_min_time=1s \
+            --benchmark_min_time=1 \
             --benchmark_out=base_results.json \
             --benchmark_out_format=json
       - name: Compare results
         run: |
-          # Simple comparison: fail if PR is >10% slower than base on any benchmark
           python3 -c "
           import json, sys
           base = {b['name']: b['real_time'] for b in json.load(open('base_results.json'))['benchmarks']}
